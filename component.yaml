@@ -1,7 +1,7 @@
 platform: Common
 buildPlatform:
 displayName: MobSF Binary Scan
-description: "Runs MobSF static analysis on the built APK, AAB or IPA"
+description: "Scans the built APK, AAB or IPA for security issues"
 inputs:
 - key: "AC_MOBSF_ARTIFACT_PATH"
   isRequired: false
