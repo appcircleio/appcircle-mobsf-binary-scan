@@ -285,7 +285,7 @@ def run_main(env = {}, fake_mobsf = nil)
       success: status.success?,
       outputs: outputs,
       workspace: workspace,
-      output_dir: File.join(output_dir, 'mobsf_output'),
+      output_dir: output_dir,
       mobsf_args: File.file?(args) ? File.read(args).strip : nil,
       scanned_file: File.file?(received) ? File.read(received).strip : nil
     })
@@ -697,15 +697,20 @@ end
 RSpec.describe '#get_step_outputs' do
   let(:summary) { summarize_report(appsec_report(high: 1, warning: 2, info: 3, score: 55)) }
 
-  it 'exports the report path, the artifact and the score' do
-    outputs = get_step_outputs(summary, '/reports', '/out/app.apk')
-    expect(outputs['AC_MOBSF_REPORT_PATH']).to eq('/reports/mobsf-report.json')
+  it 'exports the artifact and the score' do
+    outputs = get_step_outputs(summary, '/out/app.apk')
     expect(outputs['AC_MOBSF_SCANNED_ARTIFACT']).to eq('/out/app.apk')
     expect(outputs['AC_MOBSF_SECURITY_SCORE']).to eq(55)
   end
 
+  # The report is published into AC_OUTPUT_DIR under a fixed name, so no report
+  # path is exported any more.
+  it 'exports no report path' do
+    expect(get_step_outputs(summary, '/out/app.apk').keys.grep(/REPORT_PATH/)).to be_empty
+  end
+
   it 'exports the counts in the form vocabulary' do
-    outputs = get_step_outputs(summary, '/reports', '/out/app.apk')
+    outputs = get_step_outputs(summary, '/out/app.apk')
     expect(outputs['AC_MOBSF_CRITICAL_COUNT']).to eq(1)
     expect(outputs['AC_MOBSF_NORMAL_COUNT']).to eq(2)
     expect(outputs['AC_MOBSF_LOW_COUNT']).to eq(3)
@@ -714,7 +719,7 @@ RSpec.describe '#get_step_outputs' do
   end
 
   it 'reports none as the worst level for a clean scan' do
-    outputs = get_step_outputs(summarize_report(appsec_report), '/reports', '/a.apk')
+    outputs = get_step_outputs(summarize_report(appsec_report), '/a.apk')
     expect(outputs['AC_MOBSF_WORST_LEVEL']).to eq('none')
   end
 end
@@ -737,7 +742,7 @@ RSpec.describe 'main.rb end to end' do
           expect(result[:mobsf_args]).to include('--action scan')
           expect(result[:mobsf_args]).to include('--scan-timeout 1800')
 
-          expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
+          expect(File.file?(File.join(result[:output_dir], 'mobsf-binary-analyze.json'))).to be true
           expect(result[:outputs]['AC_MOBSF_SECURITY_SCORE']).to eq('67')
           expect(result[:outputs]['AC_MOBSF_NORMAL_COUNT']).to eq('2')
           expect(result[:outputs]['AC_MOBSF_WORST_LEVEL']).to eq('normal')
@@ -792,7 +797,7 @@ RSpec.describe 'main.rb end to end' do
                  { report: appsec_report(high: 1, score: 20) }) do |result|
           expect(result[:success]).to be false
           expect(result[:stdout] + result[:stderr]).to include('breaks the pipeline')
-          expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
+          expect(File.file?(File.join(result[:output_dir], 'mobsf-binary-analyze.json'))).to be true
         end
       end
     end
@@ -803,6 +808,16 @@ RSpec.describe 'main.rb end to end' do
                  { report: appsec_report(score: 40) }) do |result|
           expect(result[:success]).to be false
           expect(result[:stdout] + result[:stderr]).to include('below the required 80')
+        end
+      end
+    end
+
+    it 'fails on a finding while the score is above the minimum' do
+      with_apk do |apk|
+        run_main({ 'AC_APK_PATH' => apk, 'AC_MOBSF_FAIL_ON' => 'critical', 'AC_MOBSF_MIN_SCORE' => '10' },
+                 { report: appsec_report(high: 1, score: 90) }) do |result|
+          expect(result[:success]).to be false
+          expect(result[:stdout] + result[:stderr]).to include('`critical` finding or worse')
         end
       end
     end

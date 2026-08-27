@@ -4,7 +4,7 @@ Runs full MobSF static analysis on the compiled artifact: manifest and permissio
 and signing checks, hardcoded secrets, binary protections, network security config, tracker
 detection and the scored AppSec report. Scans an **APK, AAB or IPA**.
 
-Source code analysis is a separate step, MobSF Scan, which wraps `mobsfscan`.
+Source code analysis is a separate step, MobSF Source Code Scan, which wraps `mobsfscan`.
 
 MobSF is GPL-3.0-only, so it is never shipped with Appcircle and this step never downloads it.
 The runner is provisioned with MobSF during setup, and the step only locates that installation
@@ -30,25 +30,54 @@ None. On a workflow that builds first, the step finds the artifact on its own.
   grades: `critical` is `high`, `normal` is `warning`, `low` is `info`. A `secure` entry is a
   passed check and a `hotspot` needs a human, so neither breaks the pipeline.
 - `AC_MOBSF_MIN_SCORE`: Minimum Security Score. Breaks the pipeline when MobSF's score out of
-  100 falls below this. Empty disables the check. It is independent of the level gate, so it
-  still applies when Fail Build On is `none`.
+  100 falls below this. Empty (default) disables the check. See [The two gates](#the-two-gates).
 - `AC_MOBSF_SCAN_TIMEOUT`: Scan Timeout. Seconds for the scan, default `1800`. MobSF's own
   decompile and SAST timeouts are 1000 seconds each, so keep this above their sum.
 - `AC_MOBSF_SAVE_REPORT`: Save Report. Copies the report into the artifacts folder when `true`
   (default).
 
+## The two gates
+
+Two independent gates decide the build, and **both are evaluated on every scan**:
+
+| Gate | Input | Reads |
+| --- | --- | --- |
+| Level gate | `AC_MOBSF_FAIL_ON` (Fail Build On) | the findings |
+| Score gate | `AC_MOBSF_MIN_SCORE` (Minimum Security Score) | the MobSF score out of 100 |
+
+They are not chained, so neither one gates the other:
+
+- Either gate on its own breaks the pipeline. The build fails as soon as one of them is breached,
+  whatever the other says.
+- `Fail Build On = none` disables the level gate only. The score gate stays in force, so a score
+  below the minimum still breaks the build.
+- A score comfortably above the minimum does not excuse a finding at or above the selected level,
+  and a clean level gate does not excuse a low score.
+- Leaving Minimum Security Score empty disables the score gate, and the level gate decides alone.
+
+Whichever gate breaks the build, the report is published first, so the findings stay downloadable
+on the failing path.
+
 ## Output Variables
 
-- `AC_MOBSF_REPORT_PATH`: Path of the MobSF JSON report.
 - `AC_MOBSF_SCANNED_ARTIFACT`: The artifact that was scanned.
 - `AC_MOBSF_SECURITY_SCORE`: The score out of 100.
 - `AC_MOBSF_FINDING_COUNT`, `AC_MOBSF_CRITICAL_COUNT`, `AC_MOBSF_NORMAL_COUNT`,
   `AC_MOBSF_LOW_COUNT`: Finding counts per level.
 - `AC_MOBSF_WORST_LEVEL`: `critical`, `normal`, `low`, or `none`.
 
-The report is copied to `$AC_OUTPUT_DIR/mobsf_output/mobsf-report.json`, on the failing path
-too, so a broken gate still leaves the findings downloadable. JSON is the only output: MobSF's
-PDF export needs `wkhtmltopdf`, which is not installed on the runners.
+No report path is exported: the report is written straight into `$AC_OUTPUT_DIR` under a fixed
+name, so a following step already knows where it is.
+
+## Reports
+
+The report is published directly into `$AC_OUTPUT_DIR` as `mobsf-binary-analyze.json`, under its
+own name and unarchived, so add Export Build Artifacts after this step. It is published on the
+failing path too, so a broken gate still leaves the findings downloadable.
+
+JSON is the only format MobSF reports here: its other export is a PDF, which needs
+`wkhtmltopdf`, and that is not installed on the runners. There is therefore no output format
+input on this step.
 
 The build log closes with a summary, ending in the verdict:
 

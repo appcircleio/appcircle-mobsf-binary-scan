@@ -45,8 +45,9 @@ SEVERITY_LABEL = {"ERROR" => "Critical", "WARNING" => "Normal", "INFO" => "Low"}
 DEFAULT_MOBSF_PREFIXES = ["/usr/local/appcircle/mobsf", "/opt/appcircle/mobsf"]
 MOBSF_MANIFEST_FILE = "appcircle-mobsf-manifest.json"
 MOBSF_CONTROL_SCRIPT = "mobsf-control.sh"
-MOBSF_REPORT_FILENAME = "mobsf-report.json"
-MOBSF_OUTPUT_DIRNAME = "mobsf_output"
+# JSON is the only report MobSF offers here: its other export is a PDF, which
+# needs `wkhtmltopdf` and is not installed on the runners.
+MOBSF_REPORT_FILENAME = "mobsf-binary-analyze.json"
 
 # mobsf-control.sh exit codes that the step reacts to.
 MOBSF_EXIT_USAGE = 2
@@ -475,8 +476,11 @@ def print_summary(summary, artifact, fail_on, minimum_score)
 end
 
 ###### Quality Gate
-# Fails on a finding at the selected level or worse, so `low` is the strictest
-# setting and `critical` the loosest, and on a score below the minimum.
+# The level gate and the score gate are independent, and both are evaluated on
+# every scan: the first reads the findings, so `low` is the strictest setting
+# and `critical` the loosest, the second reads the MobSF score. Either one on
+# its own breaks the pipeline, so a `none` level still leaves the score gate in
+# force, and a score above the minimum does not excuse a finding.
 # Returns the reason, or nil when the pipeline continues.
 def get_gate_failure(summary, fail_on, minimum_score)
   if minimum_score != nil && summary[:security_score] != nil &&
@@ -497,22 +501,23 @@ def get_gate_failure(summary, fail_on, minimum_score)
 end
 
 ###### Report Publishing & Environment Variables
+# The report lands directly in AC_OUTPUT_DIR under its own name, neither in a
+# subfolder nor archived, so Export Build Artifacts publishes the file as it is.
 def copy_report()
   if $output_path == nil
     puts "@@[warning] AC_OUTPUT_DIR is not set, the report is not published as an artifact."
     return nil
   end
 
-  export_path = (Pathname.new $output_path).join(MOBSF_OUTPUT_DIRNAME).to_s
   begin
-    FileUtils.mkdir_p(export_path)
-    puts "Copying #{MOBSF_REPORT_FILENAME} to #{export_path}"
-    FileUtils.cp($report_path, "#{export_path}/#{MOBSF_REPORT_FILENAME}")
+    FileUtils.mkdir_p($output_path)
+    puts "Publishing #{MOBSF_REPORT_FILENAME} to #{$output_path}"
+    FileUtils.cp($report_path, "#{$output_path}/#{MOBSF_REPORT_FILENAME}")
   rescue Exception => e
     abort_script(e)
   end
 
-  return export_path
+  return $output_path
 end
 
 def write_environment_variables(values)
@@ -530,9 +535,10 @@ def write_environment_variables(values)
   end
 end
 
-def get_step_outputs(summary, report_dir, artifact)
+# No report path is exported: the report is published into AC_OUTPUT_DIR under
+# a fixed name, so a following step already knows where to find it.
+def get_step_outputs(summary, artifact)
   return {
-    "AC_MOBSF_REPORT_PATH" => "#{report_dir}/#{MOBSF_REPORT_FILENAME}",
     "AC_MOBSF_SCANNED_ARTIFACT" => artifact,
     "AC_MOBSF_SECURITY_SCORE" => summary[:security_score],
     "AC_MOBSF_FINDING_COUNT" => summary[:total],
@@ -559,9 +565,8 @@ $report = run_scan($control, $prefix, $artifact, $scan_timeout)
 $summary = summarize_report($report)
 print_summary($summary, $artifact, $fail_on, $minimum_score)
 
-$export_path = $save_report ? copy_report() : nil
-$report_dir = $export_path != nil ? $export_path : File.dirname($report_path)
-write_environment_variables(get_step_outputs($summary, $report_dir, $artifact))
+copy_report() if $save_report
+write_environment_variables(get_step_outputs($summary, $artifact))
 
 ### The report is published either way, so a failing gate still leaves the
 ### findings downloadable.
