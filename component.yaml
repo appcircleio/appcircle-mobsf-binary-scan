@@ -17,9 +17,10 @@ inputs:
   description: "Breaks the pipeline on a finding at this level or worse. `low` is strictest, `none` only reports."
   helpText:
 - key: "AC_MOBSF_MIN_SCORE"
+  defaultValue: "0"
   isRequired: false
-  title: Minimum Security Score
-  description: "Breaks the pipeline below this MobSF score out of 100. Empty disables the check."
+  title: Fail Build Minimum Security Score
+  description: "Breaks the pipeline below this MobSF score out of 100. `0` disables the check."
   helpText:
 - key: "AC_MOBSF_SCAN_TIMEOUT"
   defaultValue: "1800"
