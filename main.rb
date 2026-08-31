@@ -1,16 +1,3 @@
-# Appcircle MobSF Binary Scan component.
-#
-# Runs full MobSF static analysis on a compiled artifact (APK, AAB or IPA)
-# using the MobSF installation the runner was provisioned with (PL-398).
-#
-# MobSF is GPL-3.0-only, so it is never downloaded or redistributed by this
-# step: the step only locates what provisioning left on the runner and drives
-# it through `mobsf-control.sh`. A runner without MobSF is an error here, not a
-# fallback, because binary analysis has no CLI equivalent.
-#
-# Only Ruby stdlib is used, steps run against the runner's system Ruby without
-# Bundler.
-
 require 'json'
 require 'open3'
 require 'pathname'
@@ -19,47 +6,33 @@ require 'shellwords'
 
 ###### Defaults & Constants
 DEFAULT_FAIL_ON = "critical"
+DEFAULT_MINIMUM_SCORE = 0
 DEFAULT_SCAN_TIMEOUT = 1800
 CONTROL_TIMEOUT_MARGIN = 60
 
 SEVERITIES = ["ERROR", "WARNING", "INFO"]
 SEVERITY_RANK = {"INFO" => 1, "WARNING" => 2, "ERROR" => 3}
 
-# The gate speaks the vocabulary the step form offers, mapped onto what MobSF
-# reports. `none` never breaks the pipeline.
 FAIL_ON_LEVELS = ["critical", "normal", "low", "none"]
 LEVEL_SEVERITY = {"critical" => "ERROR", "normal" => "WARNING", "low" => "INFO"}
 
-# MobSF grades findings as high/warning/info/secure/hotspot. Only the first
-# three are failures. `secure` is a passed check and `hotspot` needs a human,
-# so neither counts towards the gate.
 MOBSF_SEVERITY_MAP = {"high" => "ERROR", "warning" => "WARNING", "info" => "INFO"}
 MOBSF_NON_FINDING_BUCKETS = ["secure", "hotspot"]
 
-# The build log speaks the same words as the step form rather than MobSF's
-# internal grades, so the level a user picked reads back unchanged.
 SEVERITY_LABEL = {"ERROR" => "Critical", "WARNING" => "Normal", "INFO" => "Low"}
 
 ###### MobSF Installation
-# Provisioning puts MobSF here: macOS first, then Linux.
 DEFAULT_MOBSF_PREFIXES = ["/usr/local/appcircle/mobsf", "/opt/appcircle/mobsf"]
 MOBSF_MANIFEST_FILE = "appcircle-mobsf-manifest.json"
 MOBSF_CONTROL_SCRIPT = "mobsf-control.sh"
-# JSON is the only report MobSF offers here: its other export is a PDF, which
-# needs `wkhtmltopdf` and is not installed on the runners.
 MOBSF_REPORT_FILENAME = "mobsf-binary-analyze.json"
 
-# mobsf-control.sh exit codes that the step reacts to.
 MOBSF_EXIT_USAGE = 2
 MOBSF_EXIT_NOT_PROVISIONED = 3
 
 ###### Artifact
-# MobSF scans these. An AAB is converted to an APK with the bundletool that
-# ships inside MobSF, using the provisioned Java.
 SUPPORTED_ARTIFACTS = [".apk", ".aab", ".ipa"]
 
-# Checked in order when the artifact path input is left empty. Android exposes
-# the built binary directly, iOS exposes only the export directory.
 ARTIFACT_PATH_VARIABLES = ["AC_APK_PATH", "AC_AAB_PATH"]
 ARTIFACT_DIR_VARIABLES = ["AC_EXPORT_DIR", "AC_OUTPUT_DIR"]
 
@@ -72,7 +45,6 @@ def env_default(key, default)
   return (ENV[key] != nil && ENV[key] != "") ? ENV[key].strip : default
 end
 
-# The report is written here, and the runner discards it when the build ends.
 def get_step_temp()
   step_temp = env_default("AC_STEP_TEMP", nil)
   return step_temp if step_temp != nil
@@ -103,35 +75,46 @@ def abort_script(error)
 end
 
 ###### Run Command Function
-# The command is an argv array and is never handed to a shell, so a path with
-# a space or a shell metacharacter cannot be reinterpreted.
-# Returns stdout, stderr and the exit code.
+READER_DRAIN_TIMEOUT = 2
+REAP_TIMEOUT = 10
+KILL_GRACE_TIMEOUT = 3
+KILL_POLL_INTERVAL = 0.1
+
+def monotonic_now()
+  return Process.clock_gettime(Process::CLOCK_MONOTONIC)
+end
+
 def run_command(command, skip_abort, timeout = nil)
   puts "@@[command] #{command.shelljoin}"
 
   stdout_str = ""
   stderr_str = ""
-  status = nil
 
   begin
-    Open3.popen3(*command, :pgroup => true) do |stdin, stdout, stderr, wait_thr|
-      stdin.close
-      readers = [
-        Thread.new { stdout.each_line { |line| stdout_str += line } },
-        Thread.new { stderr.each_line { |line| stderr_str += line } }
-      ]
-
-      if timeout != nil && wait_thr.join(timeout) == nil
-        kill_process_group(wait_thr.pid)
-        readers.each { |reader| reader.kill }
-        abort_script("`#{File.basename(command[0])}` exceeded the #{timeout} second timeout and was terminated.")
-      end
-
-      readers.each { |reader| reader.join }
-      status = wait_thr.value
-    end
+    stdin, stdout, stderr, wait_thr = Open3.popen3(*command, :pgroup => true)
   rescue Errno::ENOENT
     abort_script("#{command[0]} was not found on this runner.")
+  end
+
+  begin
+    stdin.close
+    readers = [read_stream(stdout, stdout_str), read_stream(stderr, stderr_str)]
+
+    timed_out = wait_thr.join(timeout) == nil
+    kill_process_group(wait_thr.pid) if timed_out
+    stop_readers(readers, [stdout, stderr])
+    status = wait_thr.join(REAP_TIMEOUT) != nil ? wait_thr.value : nil
+  ensure
+    [stdout, stderr].each { |io| io.close unless io.closed? }
+  end
+
+  if timed_out
+    abort_script("`#{File.basename(command[0])}` exceeded the #{timeout} second timeout and was terminated.")
+  end
+
+  if status == nil
+    abort_script("`#{File.basename(command[0])}` could not be terminated on this runner and did " \
+                 "not report an exit code.")
   end
 
   unless status.success?
@@ -141,14 +124,46 @@ def run_command(command, skip_abort, timeout = nil)
   return stdout_str, stderr_str, status.exitstatus
 end
 
-# A stuck scan must never hang the build, so the whole process group goes down.
+def read_stream(io, buffer)
+  return Thread.new do
+    begin
+      io.each_line { |line| buffer << line }
+    rescue IOError, Errno::EBADF
+    end
+  end
+end
+
+def stop_readers(readers, streams)
+  deadline = monotonic_now() + READER_DRAIN_TIMEOUT
+  readers.each do |reader|
+    remaining = deadline - monotonic_now()
+    reader.join(remaining > 0 ? remaining : 0)
+  end
+  return if readers.none? { |reader| reader.alive? }
+
+  streams.each { |io| io.close unless io.closed? }
+  readers.each { |reader| reader.kill if reader.join(KILL_GRACE_TIMEOUT) == nil }
+end
+
 def kill_process_group(pid)
+  return unless signal_process_group(pid, "TERM")
+
+  deadline = monotonic_now() + KILL_GRACE_TIMEOUT
+  while monotonic_now() < deadline
+    return unless signal_process_group(pid, 0)
+
+    sleep KILL_POLL_INTERVAL
+  end
+
+  signal_process_group(pid, "KILL")
+end
+
+def signal_process_group(pid, signal)
   begin
-    Process.kill("TERM", -pid)
-    sleep 3
-    Process.kill("KILL", -pid)
+    Process.kill(signal, -pid)
+    return true
   rescue Errno::ESRCH, Errno::EPERM
-    return
+    return false
   end
 end
 
@@ -166,30 +181,25 @@ end
 def get_scan_timeout()
   configured = env_default("AC_MOBSF_SCAN_TIMEOUT", "#{DEFAULT_SCAN_TIMEOUT}")
   timeout = configured.to_i
-  unless timeout > 0
-    abort_script("Invalid scan timeout `#{configured}`. A positive number of seconds is expected.")
+  unless configured =~ /\A\d+\z/ && timeout > 0
+    abort_script("Invalid scan timeout `#{configured}`. A positive whole number of seconds is expected.")
   end
 
   return timeout
 end
 
-# Empty means no score gate. MobSF scores out of 100.
 def get_minimum_score()
-  configured = env_default("AC_MOBSF_MIN_SCORE", nil)
-  return nil if configured == nil
-
+  configured = env_default("AC_MOBSF_MIN_SCORE", "#{DEFAULT_MINIMUM_SCORE}")
   score = configured.to_i
   unless configured =~ /\A\d+\z/ && score <= 100
-    abort_script("Invalid minimum security score `#{configured}`. A number between 0 and 100 is expected.")
+    abort_script("Invalid minimum security score `#{configured}`. A whole number between 0 and 100 " \
+                 "is expected.")
   end
 
   return score
 end
 
 ###### Artifact Resolution
-# The input wins when it is set, and it accepts either the artifact or the
-# directory holding it, because an iOS workflow only exposes the export
-# directory. Otherwise the standard build variables are tried in turn.
 def get_artifact_path()
   configured = env_default("AC_MOBSF_ARTIFACT_PATH", nil)
   return resolve_artifact(configured, "the artifact path input") if configured != nil
@@ -258,7 +268,6 @@ def pick_single_artifact(found, directory)
 end
 
 ###### MobSF Discovery
-# The prefix comes from MOBSF_HOME, then the well known provisioning paths.
 def get_mobsf_prefix()
   candidates = []
   mobsf_home = env_default("MOBSF_HOME", nil)
@@ -289,11 +298,6 @@ def get_mobsf_control(prefix)
   return nil
 end
 
-# mobsf-control.sh ships with the runner package rather than under the MobSF
-# prefix, and the runner directory is not exposed as a build variable. On a dev
-# macOS runner MobSF sits at /usr/local/appcircle/mobsf while the script is at
-# <runner>/scripts, so every ancestor of the prefix and of the step's own
-# working directory is checked for a scripts/ directory.
 def get_mobsf_control_candidates(prefix)
   candidates = ["#{prefix}/#{MOBSF_CONTROL_SCRIPT}"]
 
@@ -313,8 +317,6 @@ def get_mobsf_control_candidates(prefix)
   return candidates.uniq
 end
 
-# The path itself and each of its parents, bounded so a pathological path
-# cannot spin.
 def ancestor_directories(path, limit = 12)
   directories = []
   current = File.expand_path(path)
@@ -329,8 +331,6 @@ def ancestor_directories(path, limit = 12)
   return directories
 end
 
-# Binary analysis has no CLI fallback, so a runner without MobSF fails the
-# step with the provisioning script named rather than degrading silently.
 def require_mobsf_installation()
   prefix = get_mobsf_prefix()
   if prefix == nil
@@ -362,7 +362,6 @@ def get_scan_command(control, prefix, artifact, report_path, timeout)
           "--scan-timeout", "#{timeout}"]
 end
 
-# Translates the control script's documented exit codes into an actionable line.
 def get_scan_failure_message(exit_code, stderr_str)
   case exit_code
   when MOBSF_EXIT_NOT_PROVISIONED
@@ -374,10 +373,6 @@ def get_scan_failure_message(exit_code, stderr_str)
   end
 end
 
-# The control script sources mobsf.env, starts MobSF if it is not already
-# answering, uploads, scans, writes the report, and removes the scan record,
-# the uploaded artifact and the decompiled sources afterwards. That last part
-# is why this step needs no rescan input: a cached scan cannot survive a build.
 def run_scan(control, prefix, artifact, timeout)
   puts "Scanning #{File.basename(artifact)} with MobSF"
   command = get_scan_command(control, prefix, artifact, $report_path, timeout)
@@ -414,9 +409,6 @@ def bucket_length(appsec, bucket)
   return appsec[bucket] != nil ? appsec[bucket].length : 0
 end
 
-# `appsec` is the one section with the same shape for APK and IPA, so it is
-# what the gate reads. MobSF folds its code analysis findings into it, mapping
-# a `good` severity onto `secure`, so nothing is lost by reading only appsec.
 def summarize_report(report)
   appsec = report["appsec"]
   if appsec == nil
@@ -470,18 +462,18 @@ def print_summary(summary, artifact, fail_on, minimum_score)
   print_summary_line("Total", "#{summary[:total]} finding(s)")
   print_summary_line("Worst level found", summary[:highest] != nil ? SEVERITY_LABEL[summary[:highest]] : "none")
   print_summary_line("Fail build on", fail_on == "none" ? "none (report only)" : fail_on)
-  print_summary_line("Minimum score", minimum_score != nil ? "#{minimum_score}" : "not set")
+  print_summary_line("Minimum score", get_minimum_score_label(minimum_score))
   print_summary_line("Verdict", get_gate_failure(summary, fail_on, minimum_score) != nil ? "pipeline breaks" : "pipeline continues")
   puts "------------------------------------------------------"
 end
 
+def get_minimum_score_label(minimum_score)
+  return "0 (no score gate)" if minimum_score == nil || minimum_score == 0
+
+  return "#{minimum_score}"
+end
+
 ###### Quality Gate
-# The level gate and the score gate are independent, and both are evaluated on
-# every scan: the first reads the findings, so `low` is the strictest setting
-# and `critical` the loosest, the second reads the MobSF score. Either one on
-# its own breaks the pipeline, so a `none` level still leaves the score gate in
-# force, and a score above the minimum does not excuse a finding.
-# Returns the reason, or nil when the pipeline continues.
 def get_gate_failure(summary, fail_on, minimum_score)
   if minimum_score != nil && summary[:security_score] != nil &&
      summary[:security_score] < minimum_score
@@ -501,8 +493,6 @@ def get_gate_failure(summary, fail_on, minimum_score)
 end
 
 ###### Report Publishing & Environment Variables
-# The report lands directly in AC_OUTPUT_DIR under its own name, neither in a
-# subfolder nor archived, so Export Build Artifacts publishes the file as it is.
 def copy_report()
   if $output_path == nil
     puts "@@[warning] AC_OUTPUT_DIR is not set, the report is not published as an artifact."
@@ -535,8 +525,6 @@ def write_environment_variables(values)
   end
 end
 
-# No report path is exported: the report is published into AC_OUTPUT_DIR under
-# a fixed name, so a following step already knows where to find it.
 def get_step_outputs(summary, artifact)
   return {
     "AC_MOBSF_SCANNED_ARTIFACT" => artifact,
@@ -568,8 +556,6 @@ print_summary($summary, $artifact, $fail_on, $minimum_score)
 copy_report() if $save_report
 write_environment_variables(get_step_outputs($summary, $artifact))
 
-### The report is published either way, so a failing gate still leaves the
-### findings downloadable.
 $failure = get_gate_failure($summary, $fail_on, $minimum_score)
 if $failure != nil
   abort_script("#{$failure}, which breaks the pipeline. The report is still published as an artifact.")

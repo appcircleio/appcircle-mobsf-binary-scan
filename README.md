@@ -12,8 +12,10 @@ and drives it through `mobsf-control.sh`. **Docker is not required.** A runner w
 fails the step with the provisioning script named, since binary analysis has no CLI equivalent
 to fall back to.
 
-Run it after **Android Build** or **Xcodebuild for Devices**, and put Export Build Artifacts
-after it.
+It scans whatever the build produced, so it works on Java / Kotlin, Objective-C / Swift,
+React Native and Flutter projects alike. Run it after the build step of the profile
+(**Android Build**, **Xcodebuild for Devices**, **Flutter Build for Android**, **Flutter Build
+for iOS**), and put Export Build Artifacts after it.
 
 ## Required Input Variables
 
@@ -29,10 +31,14 @@ None. On a workflow that builds first, the step finds the artifact on its own.
   setting and `critical` the loosest. `none` only reports. The levels map onto MobSF's own
   grades: `critical` is `high`, `normal` is `warning`, `low` is `info`. A `secure` entry is a
   passed check and a `hotspot` needs a human, so neither breaks the pipeline.
-- `AC_MOBSF_MIN_SCORE`: Minimum Security Score. Breaks the pipeline when MobSF's score out of
-  100 falls below this. Empty (default) disables the check. See [The two gates](#the-two-gates).
+- `AC_MOBSF_MIN_SCORE`: Fail Build Minimum Security Score. Breaks the pipeline when MobSF's score
+  out of 100 falls below this. `0`, the default, leaves the gate off, since no report can score
+  below it. See [The two gates](#the-two-gates).
 - `AC_MOBSF_SCAN_TIMEOUT`: Scan Timeout. Seconds for the scan, default `1800`. MobSF's own
-  decompile and SAST timeouts are 1000 seconds each, so keep this above their sum.
+  decompile and SAST timeouts are 1000 seconds each, so keep this above their sum. A whole number
+  of seconds: a value like `15m` is rejected rather than read as 15 seconds. The scan is
+  terminated together with everything it started when it hits the timeout, and the step never
+  waits longer than the timeout for it, not even for the MobSF server the control script starts.
 - `AC_MOBSF_SAVE_REPORT`: Save Report. Copies the report into the artifacts folder when `true`
   (default).
 
@@ -43,7 +49,7 @@ Two independent gates decide the build, and **both are evaluated on every scan**
 | Gate | Input | Reads |
 | --- | --- | --- |
 | Level gate | `AC_MOBSF_FAIL_ON` (Fail Build On) | the findings |
-| Score gate | `AC_MOBSF_MIN_SCORE` (Minimum Security Score) | the MobSF score out of 100 |
+| Score gate | `AC_MOBSF_MIN_SCORE` (Fail Build Minimum Security Score) | the MobSF score out of 100 |
 
 They are not chained, so neither one gates the other:
 
@@ -53,7 +59,7 @@ They are not chained, so neither one gates the other:
   below the minimum still breaks the build.
 - A score comfortably above the minimum does not excuse a finding at or above the selected level,
   and a clean level gate does not excuse a low score.
-- Leaving Minimum Security Score empty disables the score gate, and the level gate decides alone.
+- `0`, the default, leaves the score gate off, and the level gate decides alone.
 
 Whichever gate breaks the build, the report is published first, so the findings stay downloadable
 on the failing path.
@@ -92,7 +98,7 @@ The build log closes with a summary, ending in the verdict:
   Total                 10 finding(s)
   Worst level found     Critical
   Fail build on         critical
-  Minimum score         not set
+  Minimum score         0 (no score gate)
   Verdict               pipeline breaks
 ```
 

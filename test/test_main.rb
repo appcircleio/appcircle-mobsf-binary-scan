@@ -126,8 +126,6 @@ end
 require_relative '../main.rb'
 
 # ─── Global State Helpers ─────────────────────────────────────────────────────
-# main.rb keeps its configuration in globals that are assigned only when it runs
-# as the main script, so the unit tests set them directly.
 INPUT_KEYS = %w[
   AC_STEP_TEMP AC_TEMP_DIR AC_OUTPUT_DIR AC_ENV_FILE_PATH AC_EXPORT_DIR
   AC_APK_PATH AC_AAB_PATH MOBSF_HOME
@@ -144,8 +142,6 @@ def reset_inputs
   $save_report = true
 end
 
-# abort_script writes to $stderr and raises SystemExit. Returns the message, or
-# nil when the block did not abort.
 def capture_abort
   buffer = StringIO.new
   original = $stderr
@@ -197,14 +193,6 @@ def touch_artifact(dir, name)
 end
 
 # ─── Fake MobSF Runner Helper ─────────────────────────────────────────────────
-# There is no provisioned MobSF on a dev machine, so the scan is driven against
-# a stand-in mobsf-control.sh honouring the documented contract: it validates
-# the arguments, writes the report to --output and returns one of the documented
-# exit codes.
-#
-# It is planted the way a real runner is laid out, with MobSF under its own
-# prefix and the control script in a scripts/ directory further up, so the
-# step's own discovery has to find both. The step exposes no path inputs.
 def plant_fake_mobsf(workspace, report, exit_code)
   prefix = File.join(workspace, 'mobsf')
   FileUtils.mkdir_p(prefix)
@@ -245,8 +233,6 @@ def plant_fake_mobsf(workspace, report, exit_code)
 end
 
 # ─── Subprocess Helper ────────────────────────────────────────────────────────
-# Runs main.rb in a child process with a controlled ENV, the way the runner does.
-# Nil values explicitly unset keys inherited from the parent process.
 def run_main(env = {}, fake_mobsf = nil)
   Dir.mktmpdir do |workspace|
     step_temp = File.join(workspace, 'step_temp')
@@ -346,6 +332,92 @@ RSpec.describe '#get_scan_timeout' do
       ENV['AC_MOBSF_SCAN_TIMEOUT'] = 'soon'
       expect { get_scan_timeout }.to raise_error(SystemExit)
     end
+
+    it 'aborts on a value with a unit suffix instead of reading 15 seconds' do
+      ENV['AC_MOBSF_SCAN_TIMEOUT'] = '15m'
+      expect { get_scan_timeout }.to raise_error(SystemExit)
+    end
+
+    it 'aborts on exponent notation instead of reading 1 second' do
+      ENV['AC_MOBSF_SCAN_TIMEOUT'] = '1e3'
+      expect { get_scan_timeout }.to raise_error(SystemExit)
+    end
+  end
+end
+
+# ─── 2b. run_command ──────────────────────────────────────────────────────────
+RSpec.describe '#run_command' do
+  before { reset_inputs }
+  after { reset_inputs }
+
+  context 'positive path' do
+    it 'returns stdout and a zero exit code' do
+      stdout_str = nil
+      exit_code = nil
+      capture_stdout do
+        stdout_str, _stderr_str, exit_code = run_command(%w[sh -c echo\ hello], true)
+      end
+      expect(stdout_str.strip).to eq('hello')
+      expect(exit_code).to eq(0)
+    end
+
+    it 'captures output larger than the pipe buffer' do
+      stdout_str = nil
+      capture_stdout do
+        stdout_str, = run_command(['sh', '-c', 'i=0; while [ $i -lt 20000 ]; do ' \
+                                   'echo "line $i"; i=$((i+1)); done'], true, 60)
+      end
+      expect(stdout_str.lines.length).to eq(20_000)
+      expect(stdout_str.lines.last.strip).to eq('line 19999')
+    end
+  end
+
+  context 'negative path – timeout exceeded' do
+    it 'terminates the command so a stuck scan cannot hang the build' do
+      message = nil
+      capture_stdout { message = capture_abort { run_command(%w[sleep 30], true, 1) } }
+      expect(message).to include('exceeded the 1 second timeout')
+    end
+
+    it 'fires at the timeout rather than after the kill grace period' do
+      elapsed = nil
+      capture_stdout do
+        capture_abort do
+          started = monotonic_now()
+          run_command(%w[sleep 30], true, 1)
+        ensure
+          elapsed = monotonic_now() - started
+        end
+      end
+      expect(elapsed).to be < 2.5
+    end
+
+    it 'does not wait on a background process that outlived the command' do
+      stdout_str = nil
+      exit_code = nil
+      elapsed = nil
+      capture_stdout do
+        started = monotonic_now()
+        stdout_str, _stderr_str, exit_code = run_command(
+          ['sh', '-c', 'sleep 30 & echo started'], true, 2)
+        elapsed = monotonic_now() - started
+      end
+      expect(elapsed).to be < 5
+      expect(stdout_str.strip).to eq('started')
+      expect(exit_code).to eq(0)
+    end
+
+    it 'escalates to KILL when the command ignores TERM' do
+      message = nil
+      elapsed = nil
+      capture_stdout do
+        started = monotonic_now()
+        message = capture_abort { run_command(['sh', '-c', 'trap "" TERM; sleep 30'], true, 1) }
+        elapsed = monotonic_now() - started
+      end
+      expect(message).to include('exceeded the 1 second timeout')
+      expect(elapsed).to be < 10
+    end
   end
 end
 
@@ -355,8 +427,8 @@ RSpec.describe '#get_minimum_score' do
   after { reset_inputs }
 
   context 'positive path' do
-    it 'is unset by default, so the score gate is off' do
-      expect(get_minimum_score).to be_nil
+    it 'defaults to 0, so the score gate is off' do
+      expect(get_minimum_score).to eq(0)
     end
 
     it 'accepts a score in range' do
@@ -364,9 +436,9 @@ RSpec.describe '#get_minimum_score' do
       expect(get_minimum_score).to eq(45)
     end
 
-    it 'accepts zero' do
-      ENV['AC_MOBSF_MIN_SCORE'] = '0'
-      expect(get_minimum_score).to eq(0)
+    it 'accepts 100 as the strictest gate' do
+      ENV['AC_MOBSF_MIN_SCORE'] = '100'
+      expect(get_minimum_score).to eq(100)
     end
   end
 
@@ -380,13 +452,20 @@ RSpec.describe '#get_minimum_score' do
       ENV['AC_MOBSF_MIN_SCORE'] = 'high'
       expect(capture_abort { get_minimum_score }).to include('between 0 and 100')
     end
+
+    it 'aborts on a fractional score' do
+      ENV['AC_MOBSF_MIN_SCORE'] = '45.5'
+      expect(capture_abort { get_minimum_score }).to include('between 0 and 100')
+    end
+
+    it 'aborts on exponent notation' do
+      ENV['AC_MOBSF_MIN_SCORE'] = '1e2'
+      expect(capture_abort { get_minimum_score }).to include('between 0 and 100')
+    end
   end
 end
 
 # ─── 4. get_artifact_path ─────────────────────────────────────────────────────
-# Android exposes the built binary directly, iOS only the export directory, so
-# the resolver accepts a file or a folder and falls back through the standard
-# build variables.
 RSpec.describe '#get_artifact_path' do
   before { reset_inputs }
   after { reset_inputs }
@@ -436,7 +515,6 @@ RSpec.describe '#get_artifact_path' do
       end
     end
 
-    # An iOS workflow exposes no IPA path, only the export directory.
     it 'finds the .ipa under AC_EXPORT_DIR' do
       Dir.mktmpdir do |dir|
         ipa = touch_artifact(dir, 'Appcircle.ipa')
@@ -480,8 +558,6 @@ RSpec.describe '#get_artifact_path' do
       expect(capture_abort { get_artifact_path }).to include('does not exist')
     end
 
-    # An archive is not an artifact, and this is the mistake an iOS workflow
-    # invites, since the archive is what lands in the output directory.
     it 'aborts on an unsupported extension and says to export the ipa' do
       Dir.mktmpdir do |dir|
         archive = touch_artifact(dir, 'build.xcarchive')
@@ -514,8 +590,6 @@ RSpec.describe '#get_mobsf_control' do
     path
   end
 
-  # A dev macOS runner has MobSF at /usr/local/appcircle/mobsf with the script
-  # one level up, in the runner package.
   context 'positive path' do
     it 'finds the script in a scripts/ directory beside the prefix' do
       Dir.mktmpdir do |root|
@@ -619,7 +693,6 @@ RSpec.describe '#summarize_report' do
       expect(summary[:trackers]).to eq(7)
     end
 
-    # A passed check and one needing review are not failures.
     it 'counts secure and hotspot outside the total' do
       expect(summary[:extras]['secure']).to eq(4)
       expect(summary[:extras]['hotspot']).to eq(5)
@@ -653,19 +726,19 @@ RSpec.describe '#get_gate_failure' do
 
   context 'positive path – pipeline continues' do
     it 'passes normal findings at the critical gate' do
-      expect(get_gate_failure(normal, 'critical', nil)).to be_nil
+      expect(get_gate_failure(normal, 'critical', 0)).to be_nil
     end
 
     it 'passes low findings at the normal gate' do
-      expect(get_gate_failure(low, 'normal', nil)).to be_nil
+      expect(get_gate_failure(low, 'normal', 0)).to be_nil
     end
 
     it 'passes everything at none' do
-      expect(get_gate_failure(critical, 'none', nil)).to be_nil
+      expect(get_gate_failure(critical, 'none', 0)).to be_nil
     end
 
     it 'passes a clean report at every level' do
-      FAIL_ON_LEVELS.each { |level| expect(get_gate_failure(clean, level, nil)).to be_nil }
+      FAIL_ON_LEVELS.each { |level| expect(get_gate_failure(clean, level, 0)).to be_nil }
     end
 
     it 'passes when the score meets the minimum' do
@@ -675,18 +748,17 @@ RSpec.describe '#get_gate_failure' do
 
   context 'negative path – pipeline breaks' do
     it 'fails on a critical finding at the critical gate' do
-      expect(get_gate_failure(critical, 'critical', nil)).to include('`critical` finding or worse')
+      expect(get_gate_failure(critical, 'critical', 0)).to include('`critical` finding or worse')
     end
 
     it 'fails on a normal finding at the normal gate' do
-      expect(get_gate_failure(normal, 'normal', nil)).to include('`normal` finding or worse')
+      expect(get_gate_failure(normal, 'normal', 0)).to include('`normal` finding or worse')
     end
 
     it 'fails on a low finding at the low gate' do
-      expect(get_gate_failure(low, 'low', nil)).to include('`low` finding or worse')
+      expect(get_gate_failure(low, 'low', 0)).to include('`low` finding or worse')
     end
 
-    # The score gate is independent, so it applies even in report only mode.
     it 'fails on a score below the minimum even when the level gate is none' do
       expect(get_gate_failure(critical, 'none', 50)).to include('30 is below the required 50')
     end
@@ -703,8 +775,6 @@ RSpec.describe '#get_step_outputs' do
     expect(outputs['AC_MOBSF_SECURITY_SCORE']).to eq(55)
   end
 
-  # The report is published into AC_OUTPUT_DIR under a fixed name, so no report
-  # path is exported any more.
   it 'exports no report path' do
     expect(get_step_outputs(summary, '/out/app.apk').keys.grep(/REPORT_PATH/)).to be_empty
   end
@@ -725,7 +795,6 @@ RSpec.describe '#get_step_outputs' do
 end
 
 # ─── 11. End to end ───────────────────────────────────────────────────────────
-# Runs main.rb the way the runner does, against a stand-in mobsf-control.sh.
 RSpec.describe 'main.rb end to end' do
   def with_apk
     Dir.mktmpdir do |dir|
@@ -764,8 +833,6 @@ RSpec.describe 'main.rb end to end' do
     end
   end
 
-  # MobSF converts an AAB to an APK with its own bundletool, so an AAB is a
-  # supported artifact rather than an early failure.
   context 'positive path – AAB scanned' do
     it 'sends the AAB from AC_AAB_PATH' do
       Dir.mktmpdir do |dir|
@@ -833,8 +900,6 @@ RSpec.describe 'main.rb end to end' do
     end
   end
 
-  # Binary analysis has no CLI fallback, so an unprovisioned runner is a
-  # failure with the provisioning script named, not a silent degradation.
   context 'negative path – MobSF not provisioned' do
     it 'fails naming setup-mobsf.sh' do
       with_apk do |apk|
