@@ -12,8 +12,10 @@ and drives it through `mobsf-control.sh`. **Docker is not required.** A runner w
 fails the step with the provisioning script named, since binary analysis has no CLI equivalent
 to fall back to.
 
-Run it after **Android Build** or **Xcodebuild for Devices**, and put Export Build Artifacts
-after it.
+It scans whatever the build produced, so it works on Java / Kotlin, Objective-C / Swift,
+React Native and Flutter projects alike. Run it after the build step of the profile
+(**Android Build**, **Xcodebuild for Devices**, **Flutter Build for Android**, **Flutter Build
+for iOS**), and put Export Build Artifacts after it.
 
 ## Required Input Variables
 
